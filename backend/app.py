@@ -21,6 +21,11 @@ db = firestore.client()
 POLLS_COLLECTION = "polls"
 USERS_COLLECTION = "users"
 
+# Hardcoded Admin Credentials
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "admin@password123" # You can change this
+
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -57,8 +62,8 @@ def register():
     if existing_users:
         return jsonify({"error": "Username already exists"}), 400
 
-    # For testing purposes, if username contains 'admin', we make them an admin.
-    role = "admin" if "admin" in username.lower() else "member"
+    # For security, all new registrations are strictly members.
+    role = "member"
 
     hashed_pw = generate_password_hash(password)
     doc_ref = db.collection(USERS_COLLECTION).document()
@@ -82,6 +87,16 @@ def login():
     if not username or not password:
         return jsonify({"error": "Username and password are required"}), 400
 
+    # 1. Check if it's the hardcoded admin
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        return jsonify({
+            "message": "Admin login successful",
+            "id": "admin_default",
+            "username": ADMIN_USERNAME,
+            "role": "admin"
+        }), 200
+
+    # 2. Check Firestore for regular members
     users = db.collection(USERS_COLLECTION).where("username", "==", username).limit(1).get()
     if not users:
         return jsonify({"error": "Invalid username or password"}), 401
