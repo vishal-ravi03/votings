@@ -1,49 +1,24 @@
-"""Voting System - Flask REST API with Firebase Firestore."""
+"""Voting System - Flask REST API with Supabase PostgreSQL."""
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-import firebase_admin
-from firebase_admin import credentials, firestore
-from config import FIREBASE_CREDENTIALS
+from supabase import create_client, Client
+from config import SUPABASE_URL, SUPABASE_KEY, validate_supabase_config
 
 app = Flask(__name__)
 CORS(app)
 
 # ---------------------------------------------------------------------------
-# Firebase initialisation
+# Supabase initialisation
 # ---------------------------------------------------------------------------
 
-cred = credentials.Certificate(FIREBASE_CREDENTIALS)
-# Prevent crash during "warm starts" on Vercel
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred)
-db = firestore.client()
-
-POLLS_COLLECTION = "polls"
-USERS_COLLECTION = "users"
+validate_supabase_config()
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Hardcoded Admin Credentials
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin@password123" # You can change this
-
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def poll_to_dict(doc):
-    """Convert a Firestore document snapshot to a JSON-friendly dict."""
-    data = doc.to_dict()
-    data["id"] = doc.id
-    options = data.get("options", [])
-    data["total_votes"] = sum(opt.get("vote_count", 0) for opt in options)
-    # Firestore Timestamps → ISO strings
-    if data.get("created_at"):
-        data["created_at"] = data["created_at"].isoformat()
-    return data
-
 
 # ---------------------------------------------------------------------------
 # Authentication Routes
@@ -60,23 +35,24 @@ def register():
         return jsonify({"error": "Username and password are required"}), 400
 
     # Ensure username is unique
-    existing_users = db.collection(USERS_COLLECTION).where("username", "==", username).limit(1).get()
-    if existing_users:
+    existing = supabase.table("users").select("*").eq("username", username).execute()
+    if existing.data:
         return jsonify({"error": "Username already exists"}), 400
 
-    # For security, all new registrations are strictly members.
     role = "member"
-
     hashed_pw = generate_password_hash(password)
-    doc_ref = db.collection(USERS_COLLECTION).document()
-    doc_ref.set({
+    
+    response = supabase.table("users").insert({
         "username": username,
         "password": hashed_pw,
-        "role": role,
-        "created_at": firestore.SERVER_TIMESTAMP,
-    })
+        "role": role
+    }).execute()
+    
+    if not response.data:
+        return jsonify({"error": "Failed to create user"}), 500
 
-    return jsonify({"message": "User registered successfully", "id": doc_ref.id, "role": role}), 201
+    new_user = response.data[0]
+    return jsonify({"message": "User registered successfully", "id": new_user["id"], "role": role}), 201
 
 
 @app.route("/api/auth/login", methods=["POST"])
@@ -98,20 +74,18 @@ def login():
             "role": "admin"
         }), 200
 
-    # 2. Check Firestore for regular members
-    users = db.collection(USERS_COLLECTION).where("username", "==", username).limit(1).get()
-    if not users:
+    # 2. Check Supabase for regular members
+    users = supabase.table("users").select("*").eq("username", username).execute()
+    if not users.data:
         return jsonify({"error": "Invalid username or password"}), 401
 
-    user_doc = users[0]
-    user_data = user_doc.to_dict()
-
+    user_data = users.data[0]
     if not check_password_hash(user_data["password"], password):
         return jsonify({"error": "Invalid username or password"}), 401
 
     return jsonify({
         "message": "Login successful",
-        "id": user_doc.id,
+        "id": user_data["id"],
         "username": user_data["username"],
         "role": user_data.get("role", "member")
     }), 200
@@ -119,21 +93,8 @@ def login():
 @app.route("/api/users", methods=["GET"])
 def get_users():
     """Admin only: list all members."""
-    # In a real app we'd secure this with a JWT token check for the admin role. 
-    # For MVP, we simply return all users for the frontend dashboard.
-    docs = db.collection(USERS_COLLECTION).order_by("created_at", direction=firestore.Query.DESCENDING).stream()
-    users = []
-    for doc in docs:
-        data = doc.to_dict()
-        # Do not return hashed passwords
-        user_info = {
-            "id": doc.id,
-            "username": data.get("username"),
-            "role": data.get("role", "member"),
-            "created_at": data.get("created_at").isoformat() if data.get("created_at") else None
-        }
-        users.append(user_info)
-    return jsonify(users)
+    users_resp = supabase.table("users").select("id, username, role, created_at").order("created_at", desc=True).execute()
+    return jsonify(users_resp.data)
 
 # ---------------------------------------------------------------------------
 # API Routes
@@ -141,17 +102,25 @@ def get_users():
 
 @app.route("/api/polls", methods=["GET"])
 def get_polls():
-    """List all polls (newest first)."""
-    docs = (
-        db.collection(POLLS_COLLECTION)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .stream()
-    )
-    polls = []
-    for doc in docs:
-        d = poll_to_dict(doc)
-        polls.append(d)
-    return jsonify(polls)
+    """List all polls with their options (newest first)."""
+    # Supabase allows fetching relational data using foreign keys
+    polls_resp = supabase.table("polls").select("*, options(*)").order("created_at", desc=True).execute()
+    polls = polls_resp.data
+    
+    # Format the data to match frontend expectations
+    formatted_polls = []
+    for poll in polls:
+        total_votes = sum(opt.get("vote_count", 0) for opt in poll.get("options", []))
+        formatted_polls.append({
+            "id": poll["id"],
+            "title": poll["title"],
+            "description": poll.get("description", ""),
+            "created_at": poll.get("created_at"),
+            "options": poll.get("options", []),
+            "total_votes": total_votes
+        })
+        
+    return jsonify(formatted_polls)
 
 
 @app.route("/api/polls", methods=["POST"])
@@ -167,33 +136,55 @@ def create_poll():
     if len(raw_options) < 2:
         return jsonify({"error": "At least 2 options are required"}), 400
 
-    options = []
-    for idx, opt in enumerate(raw_options):
+    # Insert poll
+    poll_resp = supabase.table("polls").insert({
+        "title": title,
+        "description": description
+    }).execute()
+    
+    if not poll_resp.data:
+        return jsonify({"error": "Failed to create poll"}), 500
+        
+    poll_id = poll_resp.data[0]["id"]
+    
+    # Insert options
+    options_data = []
+    for opt in raw_options:
         text = opt.strip() if isinstance(opt, str) else str(opt).strip()
         if text:
-            options.append({
-                "id": idx,
+            options_data.append({
+                "poll_id": poll_id,
                 "option_text": text,
-                "vote_count": 0,
+                "vote_count": 0
             })
+            
+    if options_data:
+        supabase.table("options").insert(options_data).execute()
 
-    doc_ref = db.collection(POLLS_COLLECTION).document()
-    doc_ref.set({
-        "title": title,
-        "description": description,
-        "options": options,
-        "created_at": firestore.SERVER_TIMESTAMP,
-    })
-    return jsonify({"id": doc_ref.id, "message": "Poll created successfully"}), 201
+    return jsonify({"id": poll_id, "message": "Poll created successfully"}), 201
 
 
 @app.route("/api/polls/<poll_id>", methods=["GET"])
 def get_poll(poll_id):
     """Get a single poll with its options."""
-    doc = db.collection(POLLS_COLLECTION).document(poll_id).get()
-    if not doc.exists:
+    poll_resp = supabase.table("polls").select("*, options(*)").eq("id", poll_id).execute()
+    
+    if not poll_resp.data:
         return jsonify({"error": "Poll not found"}), 404
-    return jsonify(poll_to_dict(doc))
+        
+    poll = poll_resp.data[0]
+    total_votes = sum(opt.get("vote_count", 0) for opt in poll.get("options", []))
+    
+    formatted_poll = {
+        "id": poll["id"],
+        "title": poll["title"],
+        "description": poll.get("description", ""),
+        "created_at": poll.get("created_at"),
+        "options": poll.get("options", []),
+        "total_votes": total_votes
+    }
+    
+    return jsonify(formatted_poll)
 
 
 @app.route("/api/polls/<poll_id>/vote", methods=["POST"])
@@ -204,36 +195,30 @@ def vote(poll_id):
     if option_id is None:
         return jsonify({"error": "option_id is required"}), 400
 
-    doc_ref = db.collection(POLLS_COLLECTION).document(poll_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        return jsonify({"error": "Poll not found"}), 404
-
-    poll_data = doc.to_dict()
-    options = poll_data.get("options", [])
-
-    found = False
-    for opt in options:
-        if opt["id"] == option_id:
-            opt["vote_count"] = opt.get("vote_count", 0) + 1
-            found = True
-            break
-
-    if not found:
+    # Fetch the option to ensure it exists and belongs to the poll
+    opt_resp = supabase.table("options").select("*").eq("id", option_id).eq("poll_id", poll_id).execute()
+    if not opt_resp.data:
         return jsonify({"error": "Invalid option"}), 404
+        
+    current_votes = opt_resp.data[0].get("vote_count", 0)
+    
+    # Update the vote count
+    supabase.table("options").update({"vote_count": current_votes + 1}).eq("id", option_id).execute()
 
-    doc_ref.update({"options": options})
     return jsonify({"message": "Vote recorded successfully"})
 
 
 @app.route("/api/polls/<poll_id>", methods=["DELETE"])
 def delete_poll(poll_id):
     """Delete a poll."""
-    doc_ref = db.collection(POLLS_COLLECTION).document(poll_id)
-    doc = doc_ref.get()
-    if not doc.exists:
+    # Supabase foreign key ON DELETE CASCADE will automatically delete options
+    resp = supabase.table("polls").delete().eq("id", poll_id).execute()
+    
+    if not resp.data:
+        # Check if the poll actually existed or we just returned empty. 
+        # Actually with supabase-py, .delete() returns the deleted rows. If none deleted, 404.
         return jsonify({"error": "Poll not found"}), 404
-    doc_ref.delete()
+        
     return jsonify({"message": "Poll deleted successfully"})
 
 
@@ -242,6 +227,6 @@ def delete_poll(poll_id):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Database: Firebase Firestore")
+    print("Database: Supabase PostgreSQL")
     print("Server running on http://localhost:5000")
     app.run(debug=True, port=5000)
