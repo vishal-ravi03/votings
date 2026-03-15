@@ -15,7 +15,9 @@ CORS(app)
 # ---------------------------------------------------------------------------
 
 cred = credentials.Certificate(FIREBASE_CREDENTIALS)
-firebase_admin.initialize_app(cred)
+# Prevent crash during "warm starts" on Vercel
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 POLLS_COLLECTION = "polls"

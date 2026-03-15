@@ -10,10 +10,13 @@ import base64
 def get_firebase_credentials():
     b64_cred = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64")
     if b64_cred:
-        # Decode base64 to dict
-        cred_json = base64.b64decode(b64_cred).decode('utf-8')
-        return json.loads(cred_json)
-    
+        try:
+            # Decode base64 to dict
+            cred_json = base64.b64decode(b64_cred).decode('utf-8')
+            return json.loads(cred_json)
+        except Exception as e:
+            raise Exception(f"Failed to decode FIREBASE_SERVICE_ACCOUNT_B64 environment variable: {e}. Check that it is a valid Base64 string without extra characters.")
+
     # Fallback to local file
     local_path = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
     if os.path.exists(local_path):
